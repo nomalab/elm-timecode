@@ -1,311 +1,437 @@
 module Timecode exposing
-  ( valid
-  , fromSeconds
-  , toSeconds
-  , countFrames
-  , fromFrames
-  , add
-  , subtract
-  )
+    ( Timecode, fromFrameNumber, fromDisplay, fromString, withFramerateFromString, getFrameNumber, getFramerate, getDropFrame, getTime
+    , Display, display, format, fullFormat
+    , add, hours, minutes, seconds, frames
+    , Framerate(..), framerateAsFloat, framerateAsString, framerateFromFloat, framerateFromString, supportsDropFrame
+    , TimecodeError(..), errorToString
+    )
 
-{-|
+
+{-| A library for working with video timecodes, supporting [`SMPTE`][smpte] standards and drop frames.
+
+[smpte]: https://en.wikipedia.org/wiki/SMPTE_timecode
 
 # Timecode
+@docs Timecode, fromFrameNumber, fromDisplay, fromString, withFramerateFromString, add, getFrameNumber, getFramerate, getDropFrame, getTime
 
-  Simplified https://github.com/eoyilmaz/timecode elm port
+# Render
+@docs Display, display, format, fullFormat
+
+# Operations
+@docs add, hours, minutes, seconds, frames
+
+# Handle Framerate
+@docs Framerate, framerateAsFloat, framerateAsString, framerateFromFloat, framerateFromString, supportsDropFrame
+
+# Errors
+@docs TimecodeError, errorToString
 
 -}
 
-import Parser exposing (Parser, run, map, oneOf, succeed, (|.), (|=), symbol, int)
+
+import Regex
 
 
-{-| separator.
--}
-separator : String
-separator =
-  ":"
+{-| Timcode's opaque type -}
+type Timecode =
+    Timecode
+        { frameNumber : Float
+        , framerate : Framerate
+        , dropFrame : Bool
+        }
 
 
-{-| drop separator.
--}
-dropSeparator : String
-dropSeparator =
-  ";"
+{-| Display timecodes in a readable fashion -}
+type alias Display =
+    { hours : String
+    , minutes : String
+    , seconds : String
+    , frames : String
+    , fps : String
+    , dropFrame : Bool
+    }
 
 
-{-| Frame rates with drop frame
--}
-dropFrameRates =
-  [ 29.97
-  , 59.94
-  ]
+{-| Standard video framerates -}
+type Framerate
+    = FPS_24
+    | FPS_25
+    | FPS_30
+    | FPS_50
+    | FPS_60
+    | FPS_23_98
+    | FPS_29_97
+    | FPS_59_94
 
 
-{-| Represents the timecode.
--}
-type alias Timecode =
-  { frame: Int
-  , drop: Bool
-  , rate: Float
-  }
+{-| Timecode errors -}
+type TimecodeError
+    = DropFrameSupport
+    | InvalidTimecode
 
 
-{-| String representation of the timecode without frame rate
--}
-type alias TimecodeString =
-  { hour: Int
-  , minute: Int
-  , second: Int
-  , drop: Bool
-  , frame: Int
-  }
+{-| Private type that holds what's particular about each Framerate -}
+type alias FramerateInfo =
+    { frames : Float
+    , second : Float
+    , droppedFrames : Maybe Float
+    }
 
 
-{-| Parser.
--}
-timecodeString : Parser TimecodeString
-timecodeString =
-  succeed TimecodeString
-    |= paddedInt 2
-    |. symbol separator
-    |= paddedInt 2
-    |. symbol separator
-    |= paddedInt 2
-    |= oneOf
-      [ map (\_ -> False) (symbol separator)
-      , map (\_ -> True) (symbol dropSeparator)
-      ]
-    |= paddedInt 2
+{-|  English description of the error -}
+errorToString : TimecodeError -> String
+errorToString err =
+    case err of
+        DropFrameSupport -> "Drop frame is only supported for 29.97, and 59.94 framerate"
+        InvalidTimecode -> "Invalid timecode"
 
 
-{-| Validate tc string.
--}
-valid : String -> Maybe String
-valid tc =
-  Maybe.map toString (parse tc)
+getFramerateInfo : Framerate -> FramerateInfo
+getFramerateInfo framerate =
+    case framerate of
+        FPS_24    -> FramerateInfo 24 1.000 Nothing
+        FPS_25    -> FramerateInfo 25 1.000 Nothing
+        FPS_30    -> FramerateInfo 30 1.000 Nothing
+        FPS_50    -> FramerateInfo 50 1.000 Nothing
+        FPS_60    -> FramerateInfo 60 1.000 Nothing
+        FPS_23_98 -> FramerateInfo 24 1.001 Nothing
+        FPS_29_97 -> FramerateInfo 30 1.001 (Just 2)
+        FPS_59_94 -> FramerateInfo 60 1.001 (Just 4)
 
 
-{-| parse tc string.
--}
-parse : String -> Maybe TimecodeString
-parse tc =
-  case run timecodeString tc of
-    Ok rslt ->
-      Just rslt
-    Err err ->
-      Nothing
-
-
-{-| A fixed-length integer padded with zeroes.
-  https://github.com/rtfeldman/elm-iso8601-date-strings/blob/master/src/Iso8601.elm
--}
-paddedInt : Int -> Parser Int
-paddedInt quantity =
+{-| Get Timecode as a Display value -}
+display : Timecode -> Display
+display (Timecode { frameNumber, framerate, dropFrame }) =
     let
-        helper str =
-            if String.length str == quantity then
-                -- StringtoInt works on zero-padded integers
-                case String.toInt str of
-                    Just intVal ->
-                        Parser.succeed intVal
-                            |> Parser.map Parser.Done
+        hours_ =
+            modBy 24 (floor (frameNumberAdjusted / (framerateRounded * 3600)))
 
-                    Nothing ->
-                        Parser.problem ("Invalid integer: \"" ++ str ++ "\"")
+        minutes_ =
+            modBy 60 (floor (frameNumberAdjusted / (framerateRounded * 60)))
 
+        seconds_ =
+            modBy 60 (floor (frameNumberAdjusted / framerateRounded))
+
+        frames_ =
+            modBy (round framerateRounded) (round frameNumberAdjusted)
+
+        framerateInfo =
+            getFramerateInfo framerate
+
+        framerateRounded =
+            framerateInfo.frames
+
+        frameNumberAdjusted =
+            if dropFrame then
+                let
+                    droppedFramesCount =
+                        framerateInfo.droppedFrames
+                        |> Maybe.withDefault 0
+
+                    oneMinuteFramesCount =
+                        framerateRounded * 60 - droppedFramesCount
+
+                    tenMinutesFramesCount =
+                        (10 * oneMinuteFramesCount) - droppedFramesCount
+
+                    tenMinutesChunks =
+                        frameNumber / tenMinutesFramesCount
+
+                    oneMinuteChunks =
+                        modBy (round tenMinutesFramesCount) (round frameNumber)
+
+                    tenMinutesPart =
+                        (droppedFramesCount * 10 - droppedFramesCount) * tenMinutesChunks
+
+                    oneMinutePart =
+                        droppedFramesCount * ((toFloat oneMinuteChunks - droppedFramesCount) / oneMinuteFramesCount)
+                in
+                frameNumber + tenMinutesPart + (if oneMinutePart < 0 then 0 else oneMinutePart)
             else
-                Parser.chompIf Char.isDigit
-                    |> Parser.getChompedString
-                    |> Parser.map (\nextChar -> Parser.Loop <| String.append str nextChar)
+                frameNumber
+
+        doubleDigit =
+            String.fromInt >> String.padLeft 2 '0'
     in
-        Parser.loop "" helper
+    { hours     = doubleDigit hours_
+    , minutes   = doubleDigit minutes_
+    , seconds   = doubleDigit seconds_
+    , frames    = doubleDigit frames_
+    , fps       = framerateAsString framerate
+    , dropFrame = dropFrame
+    }
 
 
-{-| 0 padded String.fromInt.
--}
-pad : Int -> Int -> String
-pad n v =
-  String.padLeft n '0' (String.fromInt v)
+{-| Get Timecode from frame number -}
+fromFrameNumber : Float -> Framerate -> Bool -> Result TimecodeError Timecode
+fromFrameNumber frameNumber framerate dropFrame =
+    if dropFrame && not (supportsDropFrame framerate) then
+        Err DropFrameSupport
+    else
+        Ok <| Timecode
+            { frameNumber = frameNumber
+            , framerate   = framerate
+            , dropFrame   = dropFrame
+            }
 
 
-{-| String representation.
--}
-toString : TimecodeString -> String
-toString tc =
-  String.concat
-    [ pad 2 tc.hour
-    , separator
-    , pad 2 tc.minute
-    , separator
-    , pad 2 tc.second
-    , if tc.drop then dropSeparator else separator
-    , pad 2 tc.frame
-    ]
+{-| Get Timecode from Display value -}
+fromDisplay : Display -> Result TimecodeError Timecode
+fromDisplay display_ =
+    Maybe.map5
+        (\hours_ minutes_ seconds_ frames_ framerate_ ->
+            let
+                isOutOfBound =
+                    let
+                        hhOutOfBound = hours_   < 0 || hours_   >  23
+                        mmOutOfBound = minutes_ < 0 || minutes_ >  59
+                        ssOutOfBound = seconds_ < 0 || seconds_ >  59
+                        ffOutOfBound = frames_  < 0 || frames_  >= framerateRounded
+                        frameDropped = display_.dropFrame && seconds_ == 0 && modBy 10 (round minutes_) /= 0 && frames_ < droppedFramesCount
+                    in
+                    hhOutOfBound || mmOutOfBound || ssOutOfBound || ffOutOfBound || frameDropped
 
+                framerateInfo =
+                    getFramerateInfo framerate_
 
-{-| Count frames from given timcode and framerate.
--}
-countFrames_ : Float -> TimecodeString -> Int
-countFrames_ rate tc =
-  let
-    dropFrames =
-      if tc.drop then
-        -- drop frames = 6% of framerate rounded to nearest int
-        ceiling ((toFloat <| ceiling rate) * 0.066666)
-      else
-        0
+                framerateRounded =
+                    framerateInfo.frames
 
-    -- taking now integer value of framerate
-    fr =
-      round rate
+                droppedFramesCount =
+                    if display_.dropFrame then
+                        framerateInfo.droppedFrames
+                        |> Maybe.withDefault 0
+                    else
+                        0
 
-    hourFrames =
-      fr * 3600
+                hourFramesCount =
+                    framerateRounded * 3600
 
-    minFrames =
-      fr * 60
+                minuteFramesCount =
+                    framerateRounded * 60
 
-    totalMinutes =
-      (60 * tc.hour) + tc.minute
+                totalMinutes =
+                    (60 * hours_) + minutes_
 
-    frameNumber =
-      ((hourFrames * tc.hour) + (minFrames * tc.minute) + (fr * tc.second) + tc.frame)
-      - (dropFrames * (totalMinutes - (totalMinutes // 10)))
-
-  in
-    frameNumber + 1
-
-
-{-| Transform frame based timecode to string representation.
--}
-toTimecodeString : Timecode -> TimecodeString
-toTimecodeString tc =
-  let
-    dropFrames =
-      if tc.drop then
-        round ( (toFloat <| round tc.rate) * 0.066666)
-      else
-        0
-
-    framesPerHour =
-      round ( tc.rate * 3600 )
-
-    framesPer24Hour =
-      framesPerHour * 24
-
-    framesPer10Minutes =
-      round ( tc.rate * 600 )
-
-    framesPerMinute =
-      ((round tc.rate) * 60) - dropFrames
-
-    frameNumber =
-      tc.frame - 1
-
-    frameNumberNormalized =
-      ( case (frameNumber < 0) of
-          True ->  
-            frameNumber + framesPer24Hour
-          False ->
-            frameNumber
-      )
-        |> remainderBy framesPer24Hour
-        |> (\ n ->
-          case tc.drop of
-            True ->
-              let
-                d =
-                  n // framesPer10Minutes
-                m =
-                  remainderBy framesPer10Minutes n
-              in
-                if ( m > dropFrames ) then
-                  n + ( dropFrames * 9 * d )
-                    + dropFrames * (( m - dropFrames ) // framesPerMinute)
-                else
-                  n + ( dropFrames * 9 * d )
-            False ->
-              n
+                frameNumber =
+                    hourFramesCount * hours_ + minuteFramesCount * minutes_ + framerateRounded * seconds_ + frames_ - (droppedFramesCount * (totalMinutes - (totalMinutes / 10)))
+            in
+            if display_.dropFrame && not (supportsDropFrame framerate_) then
+                Err DropFrameSupport
+            else if isOutOfBound then
+                Err InvalidTimecode
+            else
+                Ok <| Timecode
+                    { frameNumber = frameNumber
+                    , framerate   = framerate_
+                    , dropFrame   = display_.dropFrame
+                    }
         )
-  in 
-    TimecodeString
-      (((frameNumberNormalized // (round tc.rate)) // 60) // 60)  
-      (remainderBy 60 ((frameNumberNormalized // (round tc.rate)) // 60))
-      (remainderBy 60 (frameNumberNormalized // (round tc.rate)))
-      tc.drop
-      (remainderBy (round tc.rate) frameNumberNormalized)
+        (String.toFloat display_.hours)
+        (String.toFloat display_.minutes)
+        (String.toFloat display_.seconds)
+        (String.toFloat display_.frames)
+        (framerateFromString display_.fps)
+        |> Maybe.withDefault (Err InvalidTimecode)
 
 
-{-| Get a timecode
+{-| Get Timecode from a String which contains the framerate: hh:mm:ss:ff@FPS -}
+fromString : String -> Result TimecodeError Timecode
+fromString str =
+    let
+        regex =
+            Regex.fromString "^([012]\\d):(\\d\\d):(\\d\\d)(:|;|\\.)(\\d\\d)@([\\d\\.]+)$"
+            |> Maybe.withDefault Regex.never
+
+        matches =
+            Regex.find regex str
+            |> List.head
+            |> Maybe.map .submatches
+            |> Maybe.withDefault []
+    in
+    case matches of
+        Just hours_ :: Just minutes_ :: Just seconds_ :: Just dropFrame_ :: Just frames_ :: Just framerate_ :: [] ->
+            fromDisplay
+                { hours     = hours_
+                , minutes   = minutes_
+                , seconds   = seconds_
+                , frames    = frames_
+                , fps       = framerate_
+                , dropFrame = dropFrame_ == ";"
+                }
+
+        _ ->
+            Err InvalidTimecode
+
+
+{-| Get Timecode from a String (hh:mm:ss:ff) and provided Framerate -}
+withFramerateFromString : Framerate -> String -> Result TimecodeError Timecode
+withFramerateFromString framerate str =
+    fromString (str ++ "@" ++ framerateAsString framerate)
+
+
+{-| Perform operation on frames -}
+add : (Framerate -> Float) -> Timecode -> Timecode
+add fn (Timecode tc) =
+    Timecode
+        { frameNumber = tc.frameNumber + fn tc.framerate |> round |> toFloat
+        , framerate = tc.framerate
+        , dropFrame = tc.dropFrame
+        }
+
+
+{-| Number of frames in hours
+
+```
+Timecode.add (Timecode.hours 10) myTC
+```
 -}
-toTimecode : Float -> String -> Maybe Timecode
-toTimecode rate tc =
-  let
-    tc_ =
-      parse tc
-  in
-    Maybe.map(\t -> Timecode (countFrames_ rate t) t.drop rate)  tc_
+hours : Float -> Framerate -> Float
+hours unit framerate =
+    framerateAsFloat framerate * 3600 * unit
 
 
-{-| Get duration in seconds from timecode string and frame rate
+{-| Number of frames in minutes
+
+```
+Timecode.add (Timecode.minutes 10) myTC
+```
 -}
-toSeconds : Float -> String -> Maybe Float
-toSeconds rate tc =
-  Maybe.map (\t -> (toFloat <| countFrames_ rate t) / rate ) <| parse tc
+minutes : Float -> Framerate -> Float
+minutes unit framerate =
+    framerateAsFloat framerate * 60 * unit
 
 
-{-| Count frames from timcode string with frame rate
+{-| Number of frames in seconds
+
+```
+Timecode.add (Timecode.seconds 10) myTC
+```
 -}
-countFrames : Float -> String -> Maybe Int
-countFrames rate tc =
-  Maybe.map (\t -> countFrames_ rate t) <| parse tc
+seconds : Float -> Framerate -> Float
+seconds unit framerate =
+    framerateAsFloat framerate * unit
 
 
-{-| Convert frame counter to timecode string
+{-| Number of frames in frames
+
+```
+Timecode.add (Timecode.frames 10) myTC
+```
 -}
-fromFrames : Float -> Int -> Maybe String
-fromFrames rate frames =
-  case frames > 0 of
-    True ->
-      Timecode frames (List.member rate dropFrameRates) rate
-        |> toTimecodeString
-        |> toString
-        |> Just
-    False ->
-      Nothing
+frames : Float -> Framerate -> Float
+frames unit _ =
+    unit
 
 
-{-| Convert duration to timecode string
--}
-fromSeconds : Float -> Float -> Maybe String
-fromSeconds duration rate =
-   fromFrames rate  ( truncate (duration * ( toFloat ( ceiling rate ) ) ) )
+{-| Get Timecode as a formatted String: `hh:mm:ss;ff` -}
+format : Timecode -> String
+format tc =
+    let
+        display_ = display tc
+    in
+    [ display_.hours
+    , ":"
+    , display_.minutes
+    , ":"
+    , display_.seconds
+    , if display_.dropFrame then ";" else ":"
+    , display_.frames
+    ]
+    |> String.concat
 
 
-{-| Operation on frames
--}
-op : (Int -> Int -> Int) -> Float -> String -> String -> Maybe String
-op f rate tcs1 tcs2 =
-  Maybe.map2
-    (\tc1 tc2 ->
-      Timecode
-        ( ( f ( countFrames_ rate tc1 ) ( countFrames_ rate tc2 ) ))
-        ( List.member rate dropFrameRates )
-        rate
-      |> toTimecodeString
-      |> toString
-    )
-    (parse tcs1) (parse tcs2)
+{-| Get Timecode and Framerate as a formatted String: `hh:mm:ss;ff@FPS` -}
+fullFormat : Timecode -> String
+fullFormat tc =
+    let
+        display_ = display tc
+    in
+    [ display_.hours
+    , ":"
+    , display_.minutes
+    , ":"
+    , display_.seconds
+    , if display_.dropFrame then ";" else ":"
+    , display_.frames
+    , "@"
+    , display_.fps
+    ]
+    |> String.concat
 
 
-{-| Add two timecodes
--}
-add : Float -> String -> String -> Maybe String
-add rate tcs1 tcs2 =
-  op (+) rate tcs1 tcs2
+{-| Get frame number from Timecode -}
+getFrameNumber : Timecode -> Float
+getFrameNumber (Timecode { frameNumber, framerate, dropFrame }) =
+    frameNumber
 
-{-| Subtract two timecodes
--}
-subtract : Float -> String -> String -> Maybe String
-subtract rate tcs1 tcs2 =
-  op (-) rate tcs1 tcs2
+
+{-| Get framerate from Timecode -}
+getFramerate : Timecode -> Framerate
+getFramerate (Timecode { frameNumber, framerate, dropFrame }) =
+    framerate
+
+
+{-| Get drop frame from Timecode -}
+getDropFrame : Timecode -> Bool
+getDropFrame (Timecode { frameNumber, framerate, dropFrame }) =
+    dropFrame
+
+
+{-| Get time from Timecode -}
+getTime : Timecode -> Float
+getTime (Timecode { frameNumber, framerate, dropFrame }) =
+    framerateAsFloat framerate * frameNumber
+
+
+{-| Get Framerate as a decimal, as precise as possible -}
+framerateAsFloat : Framerate -> Float
+framerateAsFloat framerate =
+    let
+        framerateInfo = getFramerateInfo framerate
+    in
+    framerateInfo.frames / framerateInfo.second
+
+
+{-| Get Framerate as String -}
+framerateAsString : Framerate -> String
+framerateAsString framerate =
+    case framerate of
+        FPS_24 -> "24"
+        FPS_25 -> "25"
+        FPS_30 -> "30"
+        FPS_50 -> "50"
+        FPS_60 -> "60"
+        FPS_23_98 -> "23.98"
+        FPS_29_97 -> "29.97"
+        FPS_59_94 -> "59.94"
+
+
+{-| Get Framerate from a decimal -}
+framerateFromFloat : Float -> Maybe Framerate
+framerateFromFloat framerate =
+    if framerate == 24 then Just FPS_24
+    else if framerate == 25 then Just FPS_25
+    else if framerate == 30 then Just FPS_30
+    else if framerate == 50 then Just FPS_50
+    else if framerate == 60 then Just FPS_60
+    else if framerate >= 23.97 && framerate <= 23.98 then Just FPS_23_98
+    else if framerate >= 29.97 && framerate <  29.98 then Just FPS_29_97
+    else if framerate >= 59.94 && framerate <  59.95 then Just FPS_59_94
+    else Nothing
+
+
+{-| Get Framerate as a decimal -}
+framerateFromString : String -> Maybe Framerate
+framerateFromString framerate =
+    String.toFloat framerate
+    |> Maybe.andThen framerateFromFloat
+
+
+{-| Does the Framerate supports drop frame? -}
+supportsDropFrame : Framerate -> Bool
+supportsDropFrame framerate =
+    getFramerateInfo framerate
+    |> .droppedFrames
+    |> (/=) Nothing
+
